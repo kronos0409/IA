@@ -1,0 +1,203 @@
+# core/Types.jl
+# Define los tipos principales utilizados en todo el sistema
+
+"""
+    PlasticityParameters
+
+Parámetros que controlan el comportamiento plástico (adaptativo) de las neuronas.
+"""
+struct PlasticityParameters
+    # Tasa base de plasticidad
+    base_rate::Float32
+    
+    # Factor de decaimiento de la plasticidad con la especialización
+    specialization_decay::Float32
+    
+    # Umbral de actividad para expansión
+    expansion_activity_threshold::Float32
+    
+    # Umbral de saturación para expansión
+    expansion_saturation_threshold::Float32
+    
+    # Tasa de adaptación para campos receptivos
+    adaptation_rate::Float32
+    
+    # Umbrales para Hebbian/anti-Hebbian learning
+    hebbian_threshold::Float32
+    anti_hebbian_threshold::Float32
+end
+
+# Constructor con valores por defecto
+function PlasticityParameters(;
+    base_rate = 0.01f0,
+    specialization_decay = 0.5f0,
+    expansion_activity_threshold = 0.7f0,
+    expansion_saturation_threshold = 0.8f0,
+    adaptation_rate = 0.05f0,
+    hebbian_threshold = 0.6f0,
+    anti_hebbian_threshold = -0.4f0
+)
+    return PlasticityParameters(
+        base_rate,
+        specialization_decay,
+        expansion_activity_threshold,
+        expansion_saturation_threshold,
+        adaptation_rate,
+        hebbian_threshold,
+        anti_hebbian_threshold
+    )
+end
+
+"""
+    ActivationParameters
+
+Parámetros para las funciones de activación volumétrica.
+"""
+struct ActivationParameters
+    # Tipo de activación
+    activation_type::Symbol
+    
+    # Factor de pendiente para adaptive_tanh
+    slope_factor::Float32
+    
+    # Beta para volumetric_swish
+    beta::Float32
+    
+    # Factor de contexto
+    context_factor::Float32
+    
+    # Factor sinusoidal para tensor_relu
+    sine_factor::Float32
+    
+    # Alpha (leak) para tensor_relu
+    alpha::Float32
+    
+    # Factor de mejora de gradiente para spatial_activation
+    gradient_enhancement::Float32
+    
+    # Radio de contexto para contextual_activation
+    context_radius::Int
+    
+    # Peso de contexto para contextual_activation
+    context_weight::Float32
+    
+    # Umbral para feature_activation
+    feature_threshold::Float32
+    
+    # Historial temporal (para temporal_activation)
+    history::Vector{Array{Float32,3}}
+end
+
+# Constructor con valores por defecto
+function ActivationParameters(;
+    activation_type = :adaptive_tanh,
+    slope_factor = 0.1f0,
+    beta = 1.0f0,
+    context_factor = 0.1f0,
+    sine_factor = 0.05f0,
+    alpha = 0.01f0,
+    gradient_enhancement = 0.2f0,
+    context_radius = 2,
+    context_weight = 0.3f0,
+    feature_threshold = 0.5f0,
+    history = Vector{Array{Float32,3}}()
+)
+    return ActivationParameters(
+        activation_type,
+        slope_factor,
+        beta,
+        context_factor,
+        sine_factor,
+        alpha,
+        gradient_enhancement,
+        context_radius,
+        context_weight,
+        feature_threshold,
+        history
+    )
+end
+
+"""
+    BrainSpaceConfig
+
+Configuración global para el espacio cerebral.
+"""
+struct BrainSpaceConfig
+    # Densidad inicial de neuronas (0.0-1.0)
+    initial_density::Float32
+    
+    # Factor de expansión del espacio
+    expansion_factor::Float32
+    
+    # Número de capas para propagación
+    propagation_layers::Int
+    
+    # Frecuencia de auto-poda (cada cuántos epochs)
+    pruning_frequency::Int
+    
+    # Radio máximo de conexión
+    max_connection_radius::Float32
+    
+    # Probabilidad base de conexión
+    base_connection_probability::Float32
+    
+    # Usar diálogo interno
+    use_internal_dialogue::Bool
+    
+    # Probabilidad de activar diálogo interno
+    dialogue_probability::Float32
+    
+    # Número de clones para diálogo interno
+    dialogue_clones::Int
+    
+    # Tipo de inicialización de pesos
+    weight_init::Symbol
+    
+    # Escala de inicialización
+    init_scale::Float32
+end
+
+# Constructor con valores por defecto
+function BrainSpaceConfig(;
+    initial_density = 0.1f0,
+    expansion_factor = 1.5f0,
+    propagation_layers = 3,
+    pruning_frequency = 10,
+    max_connection_radius = 5.0f0,
+    base_connection_probability = 0.3f0,
+    use_internal_dialogue = true,
+    dialogue_probability = 0.1f0,
+    dialogue_clones = 3,
+    weight_init = :xavier,
+    init_scale = 0.1f0
+)
+    return BrainSpaceConfig(
+        initial_density,
+        expansion_factor,
+        propagation_layers,
+        pruning_frequency,
+        max_connection_radius,
+        base_connection_probability,
+        use_internal_dialogue,
+        dialogue_probability,
+        dialogue_clones,
+        weight_init,
+        init_scale
+    )
+end
+
+"""
+    ExpansionEvent
+
+Registro de un evento de expansión del espacio cerebral.
+"""
+struct ExpansionEvent
+    # Timestamp del evento
+    timestamp::Float64
+    
+    # Región expandida
+    region::NTuple{3,UnitRange{Int}}
+    
+    # Número de nuevas neuronas añadidas
+    new_neurons::Int
+end

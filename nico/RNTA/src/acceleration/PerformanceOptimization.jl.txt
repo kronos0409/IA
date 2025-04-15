@@ -1,0 +1,1015 @@
+# acceleration/PerformanceOptimizations.jl
+# Optimizaciones generales de rendimiento para RNTA
+
+using LinearAlgebra
+using Statistics
+using Base.Threads
+
+"""
+    RNTAPerformanceConfig
+
+Configuración para optimizaciones de rendimiento.
+"""
+struct RNTAPerformanceConfig
+    # Uso de multithreading
+    use_threading::Bool
+    
+    # Número de hilos a usar (0 = auto)
+    num_threads::Int
+    
+    # Umbral para paralelización (tamaño mínimo de tensor)
+    threading_threshold::Int
+    
+    # Usar operaciones BLAS/LAPACK optimizadas cuando sea posible
+    use_blas::Bool
+    
+    # Habilitar fused operations (combinar operaciones)
+    enable_fusion::Bool
+    
+    # Tamaño del buffer de caché para reutilización
+    cache_size::Int
+    
+    # Nivel de precisión (32 o 64 bits)
+    precision::Int
+    
+    # Preallocate tensors when possible
+    preallocate_tensors::Bool
+    
+    # Use memory mapping for large tensors
+    use_memory_mapping::Bool
+    
+    # Enable kernel specialization
+    enable_kernel_specialization::Bool
+end
+
+# Configuración global
+global PERF_CONFIG = RNTAPerformanceConfig(
+    true,                # use_threading
+    0,                   # num_threads (auto)
+    1000,                # threading_threshold
+    true,                # use_blas
+    true,                # enable_fusion
+    32,                  # cache_size
+    32,                  # precision (32 bits)
+    true,                # preallocate_tensors
+    true,                # use_memory_mapping
+    true                 # enable_kernel_specialization
+)
+
+# Caché de operaciones
+global OP_CACHE = Dict{UInt64, Any}()
+
+# Contadores de rendimiento
+global PERF_COUNTERS = Dict{String, Int}(
+    "cache_hits" => 0,
+    "cache_misses" => 0,
+    "parallel_ops" => 0,
+    "sequential_ops" => 0,
+    "total_ops" => 0,
+    "total_tensor_allocations" => 0,
+    "reused_tensor_allocations" => 0
+)
+
+# Pool de tensores reusables por tamaño
+global TENSOR_POOL = Dict{NTuple{3,Int}, Vector{Array{Float32,3}}}()
+
+"""
+    init_performance_optimizations(; kwargs...)
+
+Inicializa las optimizaciones de rendimiento.
+"""
+function init_performance_optimizations(;
+    use_threading::Bool=true,
+    num_threads::Int=0,
+    threading_threshold::Int=1000,
+    use_blas::Bool=true,
+    enable_fusion::Bool=true,
+    cache_size::Int=32,
+    precision::Int=32,
+    preallocate_tensors::Bool=true,
+    use_memory_mapping::Bool=true,
+    enable_kernel_specialization::Bool=true
+)
+    # Configurar número de hilos si es automático
+    if num_threads == 0
+        num_threads = Threads.nthreads()
+    end
+    
+    # Actualizar configuración global
+    global PERF_CONFIG = RNTAPerformanceConfig(
+        use_threading,
+        num_threads,
+        threading_threshold,
+        use_blas,
+        enable_fusion,
+        cache_size,
+        precision,
+        preallocate_tensors,
+        use_memory_mapping,
+        enable_kernel_specialization
+    )
+    
+    # Inicializar caché
+    global OP_CACHE = Dict{UInt64, Any}()
+    
+    # Reiniciar contadores
+    for key in keys(PERF_COUNTERS)
+        PERF_COUNTERS[key] = 0
+    end
+    
+    # Limpiar pool de tensores
+    empty!(TENSOR_POOL)
+    
+    # Configurar BLAS si está habilitado
+    if use_blas
+        # Configurar número de hilos para BLAS
+        BLAS.set_num_threads(num_threads)
+    end
+    
+    @info "Optimizaciones de rendimiento inicializadas. Hilos: $num_threads, Precisión: $(precision) bits"
+    
+    return true
+end
+
+"""
+    get_optimal_thread_count(tensor_size::Int)
+
+Determina el número óptimo de hilos para una operación basada en el tamaño del tensor.
+"""
+function get_optimal_thread_count(tensor_size::Int)
+    if !PERF_CONFIG.use_threading || tensor_size < PERF_CONFIG.threading_threshold
+        return 1
+    end
+    
+    # Escalado del número de hilos basado en el tamaño
+    scale_factor = min(1.0, tensor_size / (PERF_CONFIG.threading_threshold * 10))
+    optimal_threads = max(1, ceil(Int, PERF_CONFIG.num_threads * scale_factor))
+    
+    return optimal_threads
+end
+
+"""
+    get_performance_stats()
+
+Devuelve estadísticas de rendimiento actuales.
+"""
+function get_performance_stats()
+    # Calcular métricas adicionales
+    cache_hit_rate = 0.0
+    total_hits_misses = PERF_COUNTERS["cache_hits"] + PERF_COUNTERS["cache_misses"]
+    if total_hits_misses > 0
+        cache_hit_rate = PERF_COUNTERS["cache_hits"] / total_hits_misses
+    end
+    
+    parallel_ratio = 0.0
+    total_ops = PERF_COUNTERS["parallel_ops"] + PERF_COUNTERS["sequential_ops"]
+    if total_ops > 0
+        parallel_ratio = PERF_COUNTERS["parallel_ops"] / total_ops
+    end
+    
+    tensor_reuse_rate = 0.0
+    total_allocations = PERF_COUNTERS["total_tensor_allocations"]
+    if total_allocations > 0
+        tensor_reuse_rate = PERF_COUNTERS["reused_tensor_allocations"] / total_allocations
+    end
+    
+    # Construir estadísticas
+    stats = Dict{String, Any}(
+        "raw_counters" => PERF_COUNTERS,
+        "cache_hit_rate" => cache_hit_rate,
+        "parallel_processing_ratio" => parallel_ratio,
+        "tensor_reuse_rate" => tensor_reuse_rate,
+        "current_cache_size" => length(OP_CACHE),
+        "current_tensor_pool_size" => sum(length(pool) for (_, pool) in TENSOR_POOL)
+    )
+    
+    return stats
+end
+
+"""
+    allocated_tensor(size, init_value=0.0f0)
+
+Obtiene un tensor del pool o crea uno nuevo si es necesario.
+"""
+function allocate_tensor(size::NTuple{3,Int}, init_value::Float32=0.0f0)
+    if !PERF_CONFIG.preallocate_tensors
+        # Si la preasignación está desactivada, simplemente crear nuevo tensor
+        PERF_COUNTERS["total_tensor_allocations"] += 1
+        return fill(init_value, size)
+    end
+    
+    # Incrementar contador de asignaciones
+    PERF_COUNTERS["total_tensor_allocations"] += 1
+    
+    # Verificar si hay tensores disponibles en el pool para este tamaño
+    if haskey(TENSOR_POOL, size) && !isempty(TENSOR_POOL[size])
+        # Reutilizar tensor del pool
+        tensor = pop!(TENSOR_POOL[size])
+        PERF_COUNTERS["reused_tensor_allocations"] += 1
+        
+        # Reinicializar valores si es necesario
+        if init_value != 0.0f0
+            fill!(tensor, init_value)
+        end
+        
+        return tensor
+    else
+        # Crear un nuevo tensor
+        return fill(init_value, size)
+    end
+end
+
+"""
+    release_tensor(tensor)
+
+Devuelve un tensor al pool para su reutilización.
+"""
+function release_tensor(tensor::Array{Float32,3})
+    if !PERF_CONFIG.preallocate_tensors
+        # Si la preasignación está desactivada, no hacer nada
+        return
+    end
+    
+    # Obtener tamaño del tensor
+    size_tuple = size(tensor)
+    
+    # Inicializar pool para este tamaño si no existe
+    if !haskey(TENSOR_POOL, size_tuple)
+        TENSOR_POOL[size_tuple] = Array{Float32,3}[]
+    end
+    
+    # Limitar tamaño del pool para este tamaño
+    if length(TENSOR_POOL[size_tuple]) < PERF_CONFIG.cache_size
+        # Limpiar tensor (poner a cero) y añadir al pool
+        fill!(tensor, 0.0f0)
+        push!(TENSOR_POOL[size_tuple], tensor)
+    end
+    
+    return nothing
+end
+
+"""
+    parallelized_operation(f, tensor, blocksize=(32,32,32))
+
+Ejecuta una operación en paralelo sobre un tensor 3D dividiendo en bloques.
+"""
+function parallelized_operation(
+    f::Function, 
+    tensor::Array{T,3}, 
+    blocksize::NTuple{3,Int}=(32,32,32)
+) where T <: AbstractFloat
+    dim_x, dim_y, dim_z = size(tensor)
+    tensor_size = dim_x * dim_y * dim_z
+    
+    # Determinar si usar paralelización
+    if !PERF_CONFIG.use_threading || tensor_size < PERF_CONFIG.threading_threshold
+        # Operación secuencial
+        PERF_COUNTERS["sequential_ops"] += 1
+        PERF_COUNTERS["total_ops"] += 1
+        return f(tensor)
+    end
+    
+    # Incrementar contadores
+    PERF_COUNTERS["parallel_ops"] += 1
+    PERF_COUNTERS["total_ops"] += 1
+    
+    # Calcular número de bloques en cada dimensión
+    block_count_x = ceil(Int, dim_x / blocksize[1])
+    block_count_y = ceil(Int, dim_y / blocksize[2])
+    block_count_z = ceil(Int, dim_z / blocksize[3])
+    total_blocks = block_count_x * block_count_y * block_count_z
+    
+    # Preparar resultado
+    result = similar(tensor)
+    
+    # Distribuir bloques entre hilos
+    Threads.@threads for block_idx in 1:total_blocks
+        # Calcular índices del bloque
+        bz = (block_idx - 1) % block_count_z + 1
+        temp = div(block_idx - 1, block_count_z)
+        by = temp % block_count_y + 1
+        bx = div(temp, block_count_y) + 1
+        
+        # Calcular rangos para este bloque
+        x_start = (bx - 1) * blocksize[1] + 1
+        y_start = (by - 1) * blocksize[2] + 1
+        z_start = (bz - 1) * blocksize[3] + 1
+        
+        x_end = min(x_start + blocksize[1] - 1, dim_x)
+        y_end = min(y_start + blocksize[2] - 1, dim_y)
+        z_end = min(z_start + blocksize[3] - 1, dim_z)
+        
+        # Extraer bloque
+        block = view(tensor, x_start:x_end, y_start:y_end, z_start:z_end)
+        
+        # Aplicar función y almacenar resultado
+        result_block = f(block)
+        result[x_start:x_end, y_start:y_end, z_start:z_end] = result_block
+    end
+    
+    return result
+end
+
+"""
+    optimized_tensor_product(a, b)
+
+Multiplicación de tensores optimizada.
+"""
+function optimized_tensor_product(a::Array{T,3}, b::Array{S,3}) where {T <: AbstractFloat, S <: AbstractFloat}
+    # Verificar si se pueden utilizar BLAS
+    if PERF_CONFIG.use_blas && all(size(a) .== size(b))
+        # Convertir a vectores y usar operación BLAS optimizada
+        a_vec = reshape(a, :)
+        b_vec = reshape(b, :)
+        
+        if PERF_CONFIG.precision == 32
+            a_f32 = convert(Vector{Float32}, a_vec)
+            b_f32 = convert(Vector{Float32}, b_vec)
+            result_vec = a_f32 .* b_f32
+        else
+            a_f64 = convert(Vector{Float64}, a_vec)
+            b_f64 = convert(Vector{Float64}, b_vec)
+            result_vec = a_f64 .* b_f64
+        end
+        
+        # Remodelar resultado a 3D
+        return reshape(result_vec, size(a))
+    else
+        # Usar paralelización por bloques para tensores grandes
+        tensor_size = prod(size(a))
+        
+        if tensor_size >= PERF_CONFIG.threading_threshold && PERF_CONFIG.use_threading
+            # Paralelizar producto elemento a elemento
+            return parallelized_operation(block -> block .* b, a)
+        else
+            # Producto elemento a elemento secuencial
+            return a .* b
+        end
+    end
+end
+
+"""
+    optimized_tensor_convolution(input, kernel; stride=(1,1,1), padding=0)
+
+Versión optimizada de tensor_convolution con caché, paralelización y BLAS.
+"""
+function optimized_tensor_convolution(
+    input::Array{T,3}, 
+    kernel::Array{S,3}; 
+    stride::NTuple{3,Int}=(1,1,1), 
+    padding::Int=0
+) where {T <: AbstractFloat, S <: AbstractFloat}
+    # Si CUDA está disponible, usar versión CUDA
+    if @isdefined(is_cuda_active) && is_cuda_active()
+        return cuda_tensor_convolution(input, kernel, stride=stride, padding=padding)
+    end
+    
+    # Calcular clave de caché
+    input_size = size(input)
+    kernel_size = size(kernel)
+    cache_key = hash((input_size, kernel_size, stride, padding, "conv3d"))
+    
+    # Verificar caché
+    if PERF_CONFIG.enable_fusion && haskey(OP_CACHE, cache_key)
+        PERF_COUNTERS["cache_hits"] += 1
+        cached_op = OP_CACHE[cache_key]
+        return cached_op(input, kernel)
+    end
+    
+    PERF_COUNTERS["cache_misses"] += 1
+    
+    # Convertir a precisión correcta
+    if PERF_CONFIG.precision == 32
+        input_f32 = convert(Array{Float32,3}, input)
+        kernel_f32 = convert(Array{Float32,3}, kernel)
+    else
+        input_f32 = convert(Array{Float64,3}, input)
+        kernel_f32 = convert(Array{Float64,3}, kernel)
+    end
+    
+    # Aplicar padding si es necesario
+    if padding > 0
+        padded_input = zero_pad(input_f32, padding)
+    else
+        padded_input = input_f32
+    end
+    
+    # Obtener dimensiones
+    in_dim_x, in_dim_y, in_dim_z = size(padded_input)
+    k_dim_x, k_dim_y, k_dim_z = size(kernel_f32)
+    
+    # Calcular dimensiones de salida
+    out_dim_x = div(in_dim_x - k_dim_x, stride[1]) + 1
+    out_dim_y = div(in_dim_y - k_dim_y, stride[2]) + 1
+    out_dim_z = div(in_dim_z - k_dim_z, stride[3]) + 1
+    
+    # Crear tensor de salida optimizado
+    output = allocate_tensor((out_dim_x, out_dim_y, out_dim_z), 0.0f0)
+    
+    # Verificar si usar paralelización
+    tensor_size = out_dim_x * out_dim_y * out_dim_z
+    use_parallel = PERF_CONFIG.use_threading && tensor_size >= PERF_CONFIG.threading_threshold
+    
+    # Definir función que realiza la operación
+    function perform_convolution(input, kernel, output)
+        # Realizar convolución
+        for x in 1:out_dim_x
+            for y in 1:out_dim_y
+                for z in 1:out_dim_z
+                    # Calcular índices de inicio en el input
+                    start_x = (x - 1) * stride[1] + 1
+                    start_y = (y - 1) * stride[2] + 1
+                    start_z = (z - 1) * stride[3] + 1
+                    
+                    # Extraer región para esta operación
+                    region = input[
+                        start_x:start_x+k_dim_x-1,
+                        start_y:start_y+k_dim_y-1,
+                        start_z:start_z+k_dim_z-1
+                    ]
+                    
+                    # Aplicar kernel (suma del producto elemento a elemento)
+                    output[x, y, z] = sum(region .* kernel)
+                end
+            end
+        end
+        
+        return output
+    end
+    
+    # Definir función especializada para caché
+    function cached_convolution(input, kernel)
+        # Aplicar padding si es necesario
+        if padding > 0
+            padded = zero_pad(input, padding)
+        else
+            padded = input
+        end
+        
+        # Crear tensor de salida
+        result = allocate_tensor((out_dim_x, out_dim_y, out_dim_z), 0.0f0)
+        
+        # Realizar convolución
+        if use_parallel
+            # Incrementar contador
+            PERF_COUNTERS["parallel_ops"] += 1
+            PERF_COUNTERS["total_ops"] += 1
+            
+            # Distribuir trabajo por bloques
+            Threads.@threads for x in 1:out_dim_x
+                for y in 1:out_dim_y
+                    for z in 1:out_dim_z
+                        # Calcular índices de inicio en el input
+                        start_x = (x - 1) * stride[1] + 1
+                        start_y = (y - 1) * stride[2] + 1
+                        start_z = (z - 1) * stride[3] + 1
+                        
+                        # Extraer región para esta operación
+                        region = padded[
+                            start_x:start_x+k_dim_x-1,
+                            start_y:start_y+k_dim_y-1,
+                            start_z:start_z+k_dim_z-1
+                        ]
+                        
+                        # Aplicar kernel
+                        result[x, y, z] = sum(region .* kernel)
+                    end
+                end
+            end
+        else
+            # Incrementar contador
+            PERF_COUNTERS["sequential_ops"] += 1
+            PERF_COUNTERS["total_ops"] += 1
+            
+            # Versión secuencial
+            for x in 1:out_dim_x
+                for y in 1:out_dim_y
+                    for z in 1:out_dim_z
+                        # Calcular índices de inicio en el input
+                        start_x = (x - 1) * stride[1] + 1
+                        start_y = (y - 1) * stride[2] + 1
+                        start_z = (z - 1) * stride[3] + 1
+                        
+                        # Extraer región para esta operación
+                        region = padded[
+                            start_x:start_x+k_dim_x-1,
+                            start_y:start_y+k_dim_y-1,
+                            start_z:start_z+k_dim_z-1
+                        ]
+                        
+                        # Aplicar kernel
+                        result[x, y, z] = sum(region .* kernel)
+                    end
+                end
+            end
+        end
+        
+        return result
+    end
+    
+    # Almacenar en caché para uso futuro
+    if PERF_CONFIG.enable_fusion
+        # Limitar tamaño de caché
+        if length(OP_CACHE) >= PERF_CONFIG.cache_size
+            # Eliminar una entrada aleatoria (simple pero efectivo)
+            delete!(OP_CACHE, first(keys(OP_CACHE)))
+        end
+        
+        # Guardar función en caché
+        OP_CACHE[cache_key] = cached_convolution
+    end
+    
+    # Realizar operación
+    if use_parallel
+        PERF_COUNTERS["parallel_ops"] += 1
+        PERF_COUNTERS["total_ops"] += 1
+        
+        # Distribuir cálculo en bloques entre hilos
+        blocksize = (
+            min(16, out_dim_x),
+            min(16, out_dim_y), 
+            min(16, out_dim_z)
+        )
+        
+        # Preparar resultado
+        result = allocate_tensor((out_dim_x, out_dim_y, out_dim_z), 0.0f0)
+        
+        # Calcular número de bloques en cada dimensión
+        block_count_x = ceil(Int, out_dim_x / blocksize[1])
+        block_count_y = ceil(Int, out_dim_y / blocksize[2])
+        block_count_z = ceil(Int, out_dim_z / blocksize[3])
+        total_blocks = block_count_x * block_count_y * block_count_z
+        
+        # Distribuir bloques entre hilos
+        Threads.@threads for block_idx in 1:total_blocks
+            # Calcular índices del bloque
+            bz = (block_idx - 1) % block_count_z + 1
+            temp = div(block_idx - 1, block_count_z)
+            by = temp % block_count_y + 1
+            bx = div(temp, block_count_y) + 1
+            
+            # Calcular rangos para este bloque
+            x_start = (bx - 1) * blocksize[1] + 1
+            y_start = (by - 1) * blocksize[2] + 1
+            z_start = (bz - 1) * blocksize[3] + 1
+            
+            x_end = min(x_start + blocksize[1] - 1, out_dim_x)
+            y_end = min(y_start + blocksize[2] - 1, out_dim_y)
+            z_end = min(z_start + blocksize[3] - 1, out_dim_z)
+            
+            # Calcular convolución para este bloque
+            for x in x_start:x_end
+                for y in y_start:y_end
+                    for z in z_start:z_end
+                        # Calcular índices de inicio en el input
+                        start_x = (x - 1) * stride[1] + 1
+                        start_y = (y - 1) * stride[2] + 1
+                        start_z = (z - 1) * stride[3] + 1
+                        
+                        # Extraer región para esta operación
+                        region = padded_input[
+                            start_x:start_x+k_dim_x-1,
+                            start_y:start_y+k_dim_y-1,
+                            start_z:start_z+k_dim_z-1
+                        ]
+                        
+                        # Aplicar kernel
+                        result[x, y, z] = sum(region .* kernel_f32)
+                    end
+                end
+            end
+        end
+        
+        return result
+    else
+        PERF_COUNTERS["sequential_ops"] += 1
+        PERF_COUNTERS["total_ops"] += 1
+        
+        # Usar versión secuencial
+        return perform_convolution(padded_input, kernel_f32, output)
+    end
+end
+
+"""
+    zero_pad(tensor, padding)
+
+Añade padding de ceros optimizado.
+"""
+function zero_pad(tensor::Array{T,3}, padding::Int) where T <: AbstractFloat
+    dim_x, dim_y, dim_z = size(tensor)
+    
+    # Crear tensor con padding
+    padded = allocate_tensor((dim_x + 2*padding, dim_y + 2*padding, dim_z + 2*padding), 0.0f0)
+    
+    # Copiar tensor original al centro
+    padded[padding+1:padding+dim_x, 
+           padding+1:padding+dim_y, 
+           padding+1:padding+dim_z] = tensor
+    
+    return padded
+end
+
+"""
+    optimized_tensor_interpolation(input, output_size; mode=:linear)
+
+Versión optimizada de tensor_interpolation.
+"""
+function optimized_tensor_interpolation(
+    input::Array{T,3}, 
+    output_size::NTuple{3,Int}; 
+    mode::Symbol=:linear
+) where T <: AbstractFloat
+    # Si CUDA está disponible, intentar usar versión CUDA
+    if @isdefined(is_cuda_active) && is_cuda_active() && @isdefined(cuda_tensor_interpolation)
+        return cuda_tensor_interpolation(input, output_size, mode=mode)
+    end
+    
+    in_dim_x, in_dim_y, in_dim_z = size(input)
+    out_dim_x, out_dim_y, out_dim_z = output_size
+    
+    # Si las dimensiones son iguales, devolver copia
+    if (in_dim_x, in_dim_y, in_dim_z) == output_size
+        return copy(input)
+    end
+    
+    # Calcular clave de caché
+    cache_key = hash((size(input), output_size, mode, "interpolation"))
+    
+    # Verificar caché
+    if PERF_CONFIG.enable_fusion && haskey(OP_CACHE, cache_key)
+        PERF_COUNTERS["cache_hits"] += 1
+        cached_op = OP_CACHE[cache_key]
+        return cached_op(input)
+    end
+    
+    PERF_COUNTERS["cache_misses"] += 1
+    
+    # Convertir a precisión correcta
+    if PERF_CONFIG.precision == 32
+        input_f32 = convert(Array{Float32,3}, input)
+    else
+        input_f32 = convert(Array{Float64,3}, input)
+    end
+    
+    # Inicializar tensor de salida
+    output = allocate_tensor(output_size, 0.0f0)
+    
+    # Calcular factores de escala
+    scale_x = (in_dim_x - 1) / (out_dim_x - 1)
+    scale_y = (in_dim_y - 1) / (out_dim_y - 1)
+    scale_z = (in_dim_z - 1) / (out_dim_z - 1)
+    
+    # Manejar caso especial de una sola unidad en alguna dimensión
+    if in_dim_x == 1
+        scale_x = 0
+    end
+    if in_dim_y == 1
+        scale_y = 0
+    end
+    if in_dim_z == 1
+        scale_z = 0
+    end
+    
+    # Verificar si usar paralelización
+    tensor_size = out_dim_x * out_dim_y * out_dim_z
+    use_parallel = PERF_CONFIG.use_threading && tensor_size >= PERF_CONFIG.threading_threshold
+    
+    # Definir función que realiza la operación completa
+    function perform_interpolation(input)
+        # Crear resultado
+        result = allocate_tensor(output_size, 0.0f0)
+        
+        if mode == :nearest
+            # Interpolación por vecino más cercano
+            for x in 1:out_dim_x
+                for y in 1:out_dim_y
+                    for z in 1:out_dim_z
+                        # Calcular coordenadas correspondientes en el input
+                        input_x = 1 + (x - 1) * scale_x
+                        input_y = 1 + (y - 1) * scale_y
+                        input_z = 1 + (z - 1) * scale_z
+                        
+                        # Redondear a entero más cercano
+                        nx = round(Int, input_x)
+                        ny = round(Int, input_y)
+                        nz = round(Int, input_z)
+                        
+                        # Asegurar que estamos dentro de los límites
+                        nx = max(1, min(nx, in_dim_x))
+                        ny = max(1, min(ny, in_dim_y))
+                        nz = max(1, min(nz, in_dim_z))
+                        
+                        result[x, y, z] = input[nx, ny, nz]
+                    end
+                end
+            end
+        else  # :linear
+            # Interpolación trilineal
+            for x in 1:out_dim_x
+                for y in 1:out_dim_y
+                    for z in 1:out_dim_z
+                        # Calcular coordenadas correspondientes en el input
+                        input_x = 1 + (x - 1) * scale_x
+                        input_y = 1 + (y - 1) * scale_y
+                        input_z = 1 + (z - 1) * scale_z
+                        
+                        # Índices de los vértices del cubo que rodea el punto
+                        x0 = floor(Int, input_x)
+                        y0 = floor(Int, input_y)
+                        z0 = floor(Int, input_z)
+                        
+                        # Asegurar que los índices están dentro de los límites
+                        x0 = max(1, min(x0, in_dim_x-1))
+                        y0 = max(1, min(y0, in_dim_y-1))
+                        z0 = max(1, min(z0, in_dim_z-1))
+                        
+                        x1 = min(x0 + 1, in_dim_x)
+                        y1 = min(y0 + 1, in_dim_y)
+                        z1 = min(z0 + 1, in_dim_z)
+                        
+                        # Pesos para la interpolación
+                        wx = input_x - x0
+                        wy = input_y - y0
+                        wz = input_z - z0
+                        
+                        # Interpolación
+                        # Interpolación
+                        c00 = input[x0, y0, z0] * (1 - wx) + input[x1, y0, z0] * wx
+                        c01 = input[x0, y0, z1] * (1 - wx) + input[x1, y0, z1] * wx
+                        c10 = input[x0, y1, z0] * (1 - wx) + input[x1, y1, z0] * wx
+                        c11 = input[x0, y1, z1] * (1 - wx) + input[x1, y1, z1] * wx
+                        
+                        c0 = c00 * (1 - wy) + c10 * wy
+                        c1 = c01 * (1 - wy) + c11 * wy
+                        
+                        result[x, y, z] = c0 * (1 - wz) + c1 * wz
+                    end
+                end
+            end
+        end
+        
+        return result
+    end
+    
+    # Almacenar función en caché
+    if PERF_CONFIG.enable_fusion
+        # Limitar tamaño de caché
+        if length(OP_CACHE) >= PERF_CONFIG.cache_size
+            # Eliminar una entrada aleatoria
+            delete!(OP_CACHE, first(keys(OP_CACHE)))
+        end
+        
+        OP_CACHE[cache_key] = perform_interpolation
+    end
+    
+    # Ejecutar interpolación
+    if use_parallel
+        PERF_COUNTERS["parallel_ops"] += 1
+        PERF_COUNTERS["total_ops"] += 1
+        
+        # Paralelizar por bloques
+        blocksize = (
+            min(16, out_dim_x),
+            min(16, out_dim_y), 
+            min(16, out_dim_z)
+        )
+        
+        # Preparar resultado
+        result = allocate_tensor(output_size, 0.0f0)
+        
+        # Calcular número de bloques en cada dimensión
+        block_count_x = ceil(Int, out_dim_x / blocksize[1])
+        block_count_y = ceil(Int, out_dim_y / blocksize[2])
+        block_count_z = ceil(Int, out_dim_z / blocksize[3])
+        total_blocks = block_count_x * block_count_y * block_count_z
+        
+        # Interpolación paralelizada por bloques
+        Threads.@threads for block_idx in 1:total_blocks
+            # Calcular índices del bloque
+            bz = (block_idx - 1) % block_count_z + 1
+            temp = div(block_idx - 1, block_count_z)
+            by = temp % block_count_y + 1
+            bx = div(temp, block_count_y) + 1
+            
+            # Calcular rangos para este bloque
+            x_start = (bx - 1) * blocksize[1] + 1
+            y_start = (by - 1) * blocksize[2] + 1
+            z_start = (bz - 1) * blocksize[3] + 1
+            
+            x_end = min(x_start + blocksize[1] - 1, out_dim_x)
+            y_end = min(y_start + blocksize[2] - 1, out_dim_y)
+            z_end = min(z_start + blocksize[3] - 1, out_dim_z)
+            
+            # Realizar interpolación para este bloque
+            if mode == :nearest
+                for x in x_start:x_end
+                    for y in y_start:y_end
+                        for z in z_start:z_end
+                            # Calcular coordenadas correspondientes en el input
+                            input_x = 1 + (x - 1) * scale_x
+                            input_y = 1 + (y - 1) * scale_y
+                            input_z = 1 + (z - 1) * scale_z
+                            
+                            # Redondear a entero más cercano
+                            nx = round(Int, input_x)
+                            ny = round(Int, input_y)
+                            nz = round(Int, input_z)
+                            
+                            # Asegurar que estamos dentro de los límites
+                            nx = max(1, min(nx, in_dim_x))
+                            ny = max(1, min(ny, in_dim_y))
+                            nz = max(1, min(nz, in_dim_z))
+                            
+                            result[x, y, z] = input_f32[nx, ny, nz]
+                        end
+                    end
+                end
+            else  # :linear
+                for x in x_start:x_end
+                    for y in y_start:y_end
+                        for z in z_start:z_end
+                            # Calcular coordenadas correspondientes en el input
+                            input_x = 1 + (x - 1) * scale_x
+                            input_y = 1 + (y - 1) * scale_y
+                            input_z = 1 + (z - 1) * scale_z
+                            
+                            # Índices de los vértices del cubo
+                            x0 = floor(Int, input_x)
+                            y0 = floor(Int, input_y)
+                            z0 = floor(Int, input_z)
+                            
+                            # Asegurar que los índices están dentro de los límites
+                            x0 = max(1, min(x0, in_dim_x-1))
+                            y0 = max(1, min(y0, in_dim_y-1))
+                            z0 = max(1, min(z0, in_dim_z-1))
+                            
+                            x1 = min(x0 + 1, in_dim_x)
+                            y1 = min(y0 + 1, in_dim_y)
+                            z1 = min(z0 + 1, in_dim_z)
+                            
+                            # Pesos para la interpolación
+                            wx = input_x - x0
+                            wy = input_y - y0
+                            wz = input_z - z0
+                            
+                            # Interpolación
+                            c00 = input_f32[x0, y0, z0] * (1 - wx) + input_f32[x1, y0, z0] * wx
+                            c01 = input_f32[x0, y0, z1] * (1 - wx) + input_f32[x1, y0, z1] * wx
+                            c10 = input_f32[x0, y1, z0] * (1 - wx) + input_f32[x1, y1, z0] * wx
+                            c11 = input_f32[x0, y1, z1] * (1 - wx) + input_f32[x1, y1, z1] * wx
+                            
+                            c0 = c00 * (1 - wy) + c10 * wy
+                            c1 = c01 * (1 - wy) + c11 * wy
+                            
+                            result[x, y, z] = c0 * (1 - wz) + c1 * wz
+                        end
+                    end
+                end
+            end
+        end
+        
+        return result
+    else
+        PERF_COUNTERS["sequential_ops"] += 1
+        PERF_COUNTERS["total_ops"] += 1
+        
+        # Ejecutar versión secuencial
+        return perform_interpolation(input_f32)
+    end
+end
+
+"""
+    optimized_volumetric_activation(tensor; type=:adaptive_tanh, parameters=nothing)
+
+Versión optimizada de volumetric_activation con multithreading y fusion.
+"""
+function optimized_volumetric_activation(
+    tensor::Array{T,3}; 
+    type::Symbol=:adaptive_tanh, 
+    parameters=nothing
+) where T <: AbstractFloat
+    # Si CUDA está disponible, intentar usar versión CUDA
+    if @isdefined(is_cuda_active) && is_cuda_active() && @isdefined(cuda_volumetric_activation)
+        return cuda_volumetric_activation(tensor, type=type, parameters=parameters)
+    end
+    
+    # Calcular clave de caché
+    cache_key = hash((size(tensor), type, parameters, "activation"))
+    
+    # Verificar caché
+    if PERF_CONFIG.enable_fusion && haskey(OP_CACHE, cache_key)
+        PERF_COUNTERS["cache_hits"] += 1
+        cached_op = OP_CACHE[cache_key]
+        return cached_op(tensor)
+    end
+    
+    PERF_COUNTERS["cache_misses"] += 1
+    
+    # Convertir a precisión correcta
+    if PERF_CONFIG.precision == 32
+        tensor_f32 = convert(Array{Float32,3}, tensor)
+    else
+        tensor_f32 = convert(Array{Float64,3}, tensor)
+    end
+    
+    # Extraer parámetros según tipo de activación
+    if type == :adaptive_tanh
+        slope_factor = 0.1f0
+        if !isnothing(parameters) && isa(parameters, ActivationParameters)
+            slope_factor = parameters.slope_factor
+        end
+        
+        # Definir operación de activación
+        function apply_adaptive_tanh(input)
+            result = similar(input)
+            
+            # Aplicar transformación elemento a elemento
+            for i in eachindex(input)
+                value = input[i]
+                adaptive_slope = 1.0f0 + slope_factor * abs(value)
+                result[i] = tanh(value * adaptive_slope)
+            end
+            
+            return result
+        end
+        
+        # Definir versión paralela para cache
+        function parallel_adaptive_tanh(input)
+            # Verificar si usar paralelización
+            if !PERF_CONFIG.use_threading || length(input) < PERF_CONFIG.threading_threshold
+                PERF_COUNTERS["sequential_ops"] += 1
+                PERF_COUNTERS["total_ops"] += 1
+                return apply_adaptive_tanh(input)
+            end
+            
+            PERF_COUNTERS["parallel_ops"] += 1
+            PERF_COUNTERS["total_ops"] += 1
+            
+            result = similar(input)
+            
+            # Usar paralelización a nivel de elemento
+            Threads.@threads for i in eachindex(input)
+                value = input[i]
+                adaptive_slope = 1.0f0 + slope_factor * abs(value)
+                result[i] = tanh(value * adaptive_slope)
+            end
+            
+            return result
+        end
+        
+        # Almacenar en caché
+        if PERF_CONFIG.enable_fusion
+            # Limitar tamaño de caché
+            if length(OP_CACHE) >= PERF_CONFIG.cache_size
+                delete!(OP_CACHE, first(keys(OP_CACHE)))
+            end
+            
+            OP_CACHE[cache_key] = parallel_adaptive_tanh
+        end
+        
+        # Verificar si usar paralelización
+        if PERF_CONFIG.use_threading && length(tensor_f32) >= PERF_CONFIG.threading_threshold
+            PERF_COUNTERS["parallel_ops"] += 1
+            PERF_COUNTERS["total_ops"] += 1
+            
+            result = similar(tensor_f32)
+            
+            # Paralelizar a nivel de elemento
+            Threads.@threads for i in eachindex(tensor_f32)
+                value = tensor_f32[i]
+                adaptive_slope = 1.0f0 + slope_factor * abs(value)
+                result[i] = tanh(value * adaptive_slope)
+            end
+            
+            return result
+        else
+            PERF_COUNTERS["sequential_ops"] += 1
+            PERF_COUNTERS["total_ops"] += 1
+            
+            return apply_adaptive_tanh(tensor_f32)
+        end
+        
+    elseif type == :tensor_relu
+        alpha = 0.01f0
+        sine_factor = 0.05f0
+        
+        if !isnothing(parameters) && isa(parameters, ActivationParameters)
+            alpha = parameters.alpha
+            sine_factor = parameters.sine_factor
+        end
+        
+        # Implementar en caché y con paralelización
+        # Similar a la implementación de adaptive_tanh anterior
+        
+        # Por brevedad, aquí usaremos la implementación estándar
+        return volumetric_activation(tensor, type=type, parameters=parameters)
+        
+    else
+        # Para otros tipos, usar implementación estándar
+        return volumetric_activation(tensor, type=type, parameters=parameters)
+    end
+end
+
+# Interfaces públicas para reemplazar funciones estándar con versiones optimizadas
+export init_performance_optimizations, get_performance_stats, allocate_tensor, release_tensor,
+       optimized_tensor_convolution, optimized_tensor_interpolation, optimized_volumetric_activation
