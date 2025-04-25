@@ -1,0 +1,66 @@
+# examples/basic_usage.jl
+# Ejemplo básico de uso de la biblioteca RNTA
+
+using RNTA
+
+# Crear un espacio cerebral 3D
+println("Creando espacio cerebral...")
+brain = create_brain(20, 20, 20)
+println("Espacio cerebral creado con éxito")
+
+# Mostrar dimensiones iniciales
+println("Dimensiones: $(brain.dimensions)")
+println("Número de neuronas: $(length(brain.neurons))")
+println("Número de conexiones: $(length(brain.connections))")
+
+# Procesar una entrada simple
+println("\nProcesando entrada...")
+input_tensor = randn(Float32, 10, 10, 3)  # Tensor de entrada
+output = process(brain, input_tensor)
+println("Procesamiento completado")
+println("Forma del output: $(size(output))")
+
+# Entrenar con datos aleatorios
+println("\nEntrenando...")
+num_samples = 20
+batch_size = 5
+epochs = 10
+
+# Generar datos de entrenamiento aleatorios
+input_data = [randn(Float32, 10, 10, 3) for _ in 1:num_samples]
+target_data = [randn(Float32, 20, 20, 20) for _ in 1:num_samples]
+
+# Entrenar
+train!(brain, input_data, target_data, epochs=epochs, batch_size=batch_size)
+println("Entrenamiento completado")
+
+# Verificar si el cerebro se expandió
+println("\nVerificando expansiones...")
+if !isempty(brain.expansion_history)
+    println("El cerebro se expandió $(length(brain.expansion_history)) veces")
+    for (i, event) in enumerate(brain.expansion_history)
+        println("  Expansión $i:")
+        println("    Tiempo: $(event.timestamp)")
+        println("    Nuevas neuronas: $(event.new_neurons)")
+    end
+else
+    println("El cerebro no se expandió durante el entrenamiento")
+end
+
+# Guardar el cerebro entrenado
+println("\nGuardando modelo...")
+save_path = "brain_model.jld2"
+save_brain(brain, save_path)
+println("Modelo guardado en: $save_path")
+
+# Visualizar actividad (solo comentado ya que requiere paquetes gráficos)
+println("\nPara visualizar la actividad del cerebro, puedes usar:")
+println("  figura = plot_brain_activity(brain)")
+println("  visualize_neuron_specialization(brain)")
+
+# Mostrar resumen final
+println("\nResumen del cerebro entrenado:")
+summary = brain_summary(brain)
+for (key, value) in summary
+    println("  $key: $value")
+end
